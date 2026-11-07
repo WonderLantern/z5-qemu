@@ -1,0 +1,14 @@
+output/
+firmware-input/
+*.bin
+*.BIN
+*.bi
+*.raw
+*.rgb
+*.ppm
+*.dump
+*.core
+*.pyc
+__pycache__/
+reference/z5-qemu/.local/
+reference/z5-qemu/.build/
