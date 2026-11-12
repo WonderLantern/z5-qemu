@@ -2,6 +2,25 @@
 """只整理任务观察证据，不控制 CPU，也不把创建调用当成运行成功。"""
 
 
+def task_from_stack(tasks, sp):
+    """Infer a task only from a unique observed task stack, never from CPU ID."""
+    matches = []
+    for task in tasks:
+        if not task.get('created') or not task.get('entry_observed'):
+            continue
+        top, size = task.get('entry_stack_pointer'), task.get('stack_bytes')
+        if top is None or not isinstance(size, int) or size <= 0:
+            continue
+        top = int(top, 16)
+        if top - size <= sp <= top:
+            matches.append(task)
+    if len(matches) != 1:
+        return None
+    task = matches[0]
+    return dict(name=task.get('name'), task_id=task.get('task_id'),
+                method='unique observed task stack range; inference')
+
+
 def gui_wait_evidence(tasks, regs):
     """C1.50 GUISRV 循环首个等待点；核对任务、栈和事件参数。"""
     candidates = [t for t in tasks if t['name'] == 'GUISRV' and t['created'] and

@@ -4,11 +4,11 @@
 字面量出现次数不等于指令引用数，更不证明外设行为兼容。
 """
 import argparse
-from publication_paths import output_root
 import binascii
 import hashlib
 import json
 from pathlib import Path
+from publication_paths import output_root
 import re
 import struct
 import subprocess

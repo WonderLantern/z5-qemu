@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from publication_paths import output_root
 import re
 import socket
 import struct
@@ -14,8 +15,8 @@ import time
 
 from inspect_inputs import BASE, COPY, MAIN_SHA256, MAIN_SIZE, SCATTER_END, SCATTER_START, ZERO
 from inspect_inputs import check_identity, read_scatter
-
-from publication_paths import output_root
+from calibration_trace import POINTS as CALIBRATION_TRACE_POINTS, observe as observe_calibration
+from make_z5_calibration import validate_input as validate_calibration_input
 
 ROOT = Path(__file__).resolve().parents[2]
 # Inherited Z6 photo-liveview device models (functional hypotheses; Z5 equivalence
@@ -53,6 +54,19 @@ POINTS = {0x1002C234: 'native_zero', 0x1002BE80: 'native_copy',
           0x1002BEDC: 'native_copy', 0x1002BF38: 'native_copy',
           0x1027E118: 'post_scatter', 0x10035708: 'kernel_start',
           0x1003BD58: 'kernel_create_task', 0x100356B8: 'init_task_entry'}
+
+
+def exception_trace_points(enabled):
+    return {0x10054680: 'cpu_exception_entry'} if enabled else {}
+
+
+def native_initialization_ranges(loaded):
+    copies = [dict(source=source, destination=destination, size=size)
+              for source, destination, size in
+              (struct.unpack_from('<3I', loaded, a - BASE)
+               for a in (0x1002C018, 0x1002C024, 0x1002C030))]
+    zero_destination, zero_size = struct.unpack_from('<2I', loaded, 0x1002C010 - BASE)
+    return copies, zero_destination, zero_size
 
 
 def describe_kernel_task(data):
@@ -146,11 +160,25 @@ def main():
     parser.add_argument('--trace-tasks', action='store_true', help='Q2：观察主要任务入口和 GUISRV 主循环等待点')
     parser.add_argument('--skip-processing-init', action='store_true', help='显式辅助：102e0b70 返回原厂失败值 6，跳过处理单元初始化')
     parser.add_argument('--display', action='store_true', help='Q3：在 Q2 之后继续诊断原厂显示输出')
+    parser.add_argument('--q3-startup-assist', action='store_true', help='旧版界面诊断：显式注入图像池、电源报告、启动完成与 MENU/刷新调用')
     parser.add_argument('--processing-init-standin', action='store_true', help='Q3 诊断模型：原厂处理初始化配置后提供合成就绪状态')
     parser.add_argument('--startup-environment-standin', action='store_true', help='Q3 诊断：合成启动测量值并清除已核对的设置初始化故障标志')
     parser.add_argument('--application-ready-standin', action='store_true', help='Q3 诊断：通过原厂队列发送合成应用就绪报告 02000004/05')
+    parser.add_argument('--startup-wait-standin', action='store_true', help='旧诊断：仅对已核对的启动等待位使用显式绕过（默认关闭）')
+    parser.add_argument('--shooting-ui-standin', action='store_true',
+                        help='界面参考：用原厂 setter 解除缺失捕获通知留下的界面忙碌状态，恢复 DISP/i；不代表传感器或取景管线就绪')
+    parser.add_argument('--i-menu-settings-standin', action='store_true',
+                        help='i 菜单显示参考：填补未知值并同步模拟品质状态；不代表相机或传感器状态')
+    parser.add_argument('--zh-hans-standin', action='store_true',
+                        help='界面参考：以原厂服务选择简体中文资源（仅当前模拟器会话）')
     parser.add_argument('--trace-error-producer', action='store_true',
                         help='Q3 诊断（只观察）：记录元素编号为错误文字 0x27E/0x27F/0x280 的文字控件构造及其调用栈')
+    parser.add_argument('--trace-calibration-loader', action='store_true',
+                        help='只观察：追踪 C1.50 区号 0x4a 的加载调用及校验返回')
+    parser.add_argument('--synthetic-calibration', type=Path,
+                        help='显式提供生成的合成调整数据文件；缺省使用擦除态')
+    parser.add_argument('--trace-card-context', action='store_true',
+                        help='只观察：记录文件替身及类 0/4 绘制的页面、任务栈和阶段')
     parser.add_argument('--sensor-standin', action='store_true',
                         help='Q3 诊断：未建模图像传感器；跳过并记录 CSEQ 设备错误报告 0x34-0x36/0x3E-0x44（1020327c 强制返回）')
     parser.add_argument('--card-standin', action='store_true',
@@ -158,12 +186,23 @@ def main():
     parser.add_argument('--q4-keys', default='',
                         help='Q4：拍摄画面出现后经原厂 AO 入口依次按键并逐张截图，如 menu,left,down*6,right')
     parser.add_argument('--q4-require-change', action='store_true', help='Q4：仅当画面相对按键前改变且连续稳定时标记通过')
+    parser.add_argument('--q4-menu-state', action='store_true', help='只读诊断：在菜单应用时记录按键前后的当前页面栈顶及行号')
+    parser.add_argument('--q4-mailbox-probe', action='store_true', help='实验诊断：宿主调用候选邮箱状态服务，记录部分任务邮箱；不证明全局空闲')
+    parser.add_argument('--mailbox-self-test', action='store_true', help='实验诊断：独立临时邮箱的空/非空/取回验证；随模拟器销毁')
+    parser.add_argument('--q4-expect-menu', default='', help='逐键预期页号:绝对行号，逗号分隔；* 表示不检查，需与展开后的按键数相同')
+    parser.add_argument('--q4-expect-frames', default='', help='逐键预期 RGB SHA-256，逗号分隔；* 表示不检查')
+    parser.add_argument('--q4-min-guest-ms', type=int, default=20000,
+                        help='Q4：每键后至少观察的客体毫秒数（默认 20000；0 恢复旧行为；视觉稳定不证明原厂任务空闲）')
+    parser.add_argument('--q4-max-guest-ms', type=int, default=60000,
+                        help='Q4：每键后客体观察毫秒上限（默认 60000）')
     parser.add_argument('--dump-ram', default='',
                         help='诊断：Q4 结束后把客体内存写入 output（逗号分隔 地址:长度，十六进制，每段最多 0x100000）')
     parser.add_argument('--q4-trace-pcs', default='',
                         help='Q4 诊断（只观察，需 --q4-trace-keys）：逗号分隔的十六进制地址，按键后记录命中时寄存器与栈上代码地址')
     parser.add_argument('--q4-trace-keys', action='store_true',
                         help='Q4 诊断（只观察）：每次按键后记录应用任务回调与 GUI 分发收到的消息（每键最多 40 条）')
+    parser.add_argument('--q4-trace-filter', default='',
+                        help='只记录指定断点处寄存器在半开区间内的事件，例如 r0:c1fc0000:c1ff0000')
     parser.add_argument('--liveview-hw-test', default='',
                         help="实时取景实验：逗号分隔 tg（继承 Z6 的 TG 周期/成对脉冲）、exmcu（EXMCU 测试设备、无镜头、拍摄同步）、raw=<output 下由 make_z5_raw.py 生成的目录>（需 tg；ingress/native0 输入及 ISP 边界和图像处理模型）")
     parser.add_argument('--capture-status-standin', action='store_true', help='诊断：在原厂读取前将已核对的未初始化捕获状态 2 改为 0')
@@ -177,6 +216,13 @@ def main():
     parser.add_argument('--interactive-port', type=int, default=0,
                         help='交互查看：启动后在 127.0.0.1:<端口> 提供网页画面和按键（需 --display）')
     parser.add_argument('--interactive-minutes', type=int, default=30, help='交互会话上限（1..120 分钟）')
+    parser.add_argument('--read-settings', default='', help='诊断：拍摄画面就绪后经原厂接口读取设置（逗号分隔十六进制编号）')
+    parser.add_argument('--early-settings', default='', help='诊断：开机电源接通后、界面建立前写入设置，编号=值（例如语言 1400=26）')
+    parser.add_argument('--write-settings', default='', help='诊断：经原厂接口写入设置，编号=值（十六进制编号，十进制值），仅本次会话')
+    parser.add_argument('--card-fail-opens', type=int, default=0,
+                        help='诊断：前 N 次打开 SHUTTER 文件夹下的文件时返回失败（模拟存储卡尚未就绪）')
+    parser.add_argument('--card-file', action='append', default=[],
+                        help='诊断：卡上文件替身，A:\\路径=主机文件（只对这些路径的 打开/读/关 生效，可多次给出）')
     parser.add_argument('--keep-awake', action='store_true',
                         help='经原厂设置接口把待机计时器 0x1121 设为 9（0 秒，不关屏），仅本次模拟器会话')
     args = parser.parse_args()
@@ -186,14 +232,26 @@ def main():
         parser.error('--skip-processing-init requires --trace-tasks')
     if args.display and not args.trace_tasks:
         parser.error('--display requires --trace-tasks')
+    if args.q3_startup_assist and not args.display:
+        parser.error('--q3-startup-assist requires --display')
     if args.processing_init_standin and (not args.display or args.skip_processing_init):
         parser.error('processing stand-in requires --display and forbids --skip-processing-init')
     if args.startup_environment_standin and not args.display:
         parser.error('startup environment stand-in requires --display')
     if args.application_ready_standin and not args.startup_environment_standin:
         parser.error('application readiness stand-in requires --startup-environment-standin')
+    if args.startup_wait_standin and not args.display:
+        parser.error('--startup-wait-standin requires --display')
+    if args.shooting_ui_standin and not (args.application_ready_standin and args.sensor_standin):
+        parser.error('--shooting-ui-standin requires --application-ready-standin and --sensor-standin')
+    if args.i_menu_settings_standin and not args.shooting_ui_standin:
+        parser.error('--i-menu-settings-standin requires --shooting-ui-standin')
+    if args.zh_hans_standin and not args.display:
+        parser.error('--zh-hans-standin requires --display')
     if args.trace_error_producer and not args.display:
         parser.error('--trace-error-producer requires --display')
+    if args.trace_card_context and not args.display:
+        parser.error('--trace-card-context requires --display')
     if args.capture_status_standin and not args.trace_error_producer:
         parser.error('--capture-status-standin requires --trace-error-producer')
     if args.sensor_calibration_standin and not args.sensor_standin:
@@ -211,6 +269,16 @@ def main():
     if args.interactive_port and (not args.display or not 1024 <= args.interactive_port <= 65535
                                   or not 1 <= args.interactive_minutes <= 120):
         parser.error('--interactive-port needs --display, a port 1024..65535 and 1..120 minutes')
+    card_files = {}
+    for item in args.card_file:
+        name, _, host = item.partition('=')
+        if not name.upper().startswith('A:\\') or not Path(host).is_file():
+            parser.error('--card-file needs A:\\PATH=existing host file')
+        data = Path(host).read_bytes()
+        card_files[name.upper()] = dict(host=str(Path(host).resolve()), size=len(data),
+                                        sha256=hashlib.sha256(data).hexdigest())
+    if card_files and not args.display:
+        parser.error('--card-file requires --display')
     if (args.lv_background or args.keep_awake) and not args.display:
         parser.error('--lv-background and --keep-awake require --display')
     if args.lv_background:
@@ -227,6 +295,15 @@ def main():
     if any(k not in Q4_KEYS for k in q4_keys) or len(q4_keys) > 40:
         parser.error('--q4-keys: unknown key or more than 40 presses; keys: ' + ','.join(Q4_KEYS))
     liveview_env = {}
+    if args.synthetic_calibration:
+        calibration_path = args.synthetic_calibration.resolve()
+        if not calibration_path.is_relative_to(output_root()):
+            parser.error('--synthetic-calibration must be below output/')
+        try:
+            validate_calibration_input(calibration_path.read_bytes())
+        except (OSError, ValueError) as exc:
+            parser.error(f'--synthetic-calibration: {exc}')
+        liveview_env['Z5_SYNTHETIC_CALIBRATION'] = str(calibration_path)
     if args.lv_background:
         liveview_env['Z5_LV_BACKGROUND'] = str(args.lv_background.resolve())
     for part in filter(None, args.liveview_hw_test.split(',')):
@@ -247,6 +324,52 @@ def main():
         parser.error('--q4-keys requires --display')
     if args.q4_require_change and not q4_keys:
         parser.error('--q4-require-change requires --q4-keys')
+    if args.q4_menu_state and not q4_keys:
+        parser.error('--q4-menu-state requires --q4-keys')
+    if args.q4_mailbox_probe and not q4_keys:
+        parser.error('--q4-mailbox-probe requires --q4-keys')
+    if args.q4_mailbox_probe and not args.mailbox_self_test:
+        parser.error('--q4-mailbox-probe requires --mailbox-self-test for flag error calibration')
+    if args.mailbox_self_test and not args.display:
+        parser.error('--mailbox-self-test requires --display')
+    menu_expected = []
+    if args.q4_expect_menu:
+        try:
+            for item in args.q4_expect_menu.split(','):
+                if item == '*':
+                    menu_expected.append(None)
+                else:
+                    page, row = (int(value, 0) for value in item.split(':'))
+                    if not (0 <= page <= 0xffff and 0 <= row <= 0xffff):
+                        raise ValueError('page or row out of range')
+                    menu_expected.append((page, row))
+            if len(menu_expected) != len(q4_keys):
+                raise ValueError('expected one entry per expanded key')
+        except ValueError as exc:
+            parser.error(f'invalid --q4-expect-menu: {exc}')
+    frame_expected = []
+    if args.q4_expect_frames:
+        from q3_display import parse_frame_expectations
+        try:
+            frame_expected = parse_frame_expectations(args.q4_expect_frames, len(q4_keys))
+        except ValueError as exc:
+            parser.error(f'invalid --q4-expect-frames: {exc}')
+    trace_filter = None
+    if args.q4_trace_filter:
+        try:
+            reg, start, end = args.q4_trace_filter.split(':')
+            start, end = int(start, 16), int(end, 16)
+            if reg not in tuple(f'r{i}' for i in range(13)) or not 0 <= start < end <= 0x100000000:
+                raise ValueError('invalid register or range')
+            if not (args.q4_trace_keys and args.q4_trace_pcs):
+                raise ValueError('requires --q4-trace-keys and --q4-trace-pcs')
+            trace_filter = dict(register=reg, start=start, end=end)
+        except ValueError as exc:
+            parser.error(f'invalid --q4-trace-filter: {exc}')
+    if not 0 <= args.q4_min_guest_ms <= 60000:
+        parser.error('--q4-min-guest-ms must be 0..60000')
+    if not max(1, args.q4_min_guest_ms) <= args.q4_max_guest_ms <= 120000:
+        parser.error('--q4-max-guest-ms must be between max(1, --q4-min-guest-ms) and 120000')
     if not 1 <= args.seconds <= 600:
         parser.error('--seconds must be 1..600')
     out = args.out.resolve()
@@ -267,11 +390,7 @@ def main():
     loaded = firmware_path.read_bytes() if patched_summary else image
     scatter = read_scatter(image, BASE, SCATTER_START, SCATTER_END, COPY, ZERO)
     # 实际 ARM reset 路径独立初始化 RW/ZI，随后直达 CRT continuation。
-    native_copies = [dict(source=source, destination=destination, size=size)
-                     for source, destination, size in
-                     (struct.unpack_from('<3I', image, a - BASE)
-                      for a in (0x1002C018, 0x1002C024, 0x1002C030))]
-    zero_destination, zero_size = struct.unpack_from('<2I', image, 0x1002C010 - BASE)
+    native_copies, zero_destination, zero_size = native_initialization_ranges(loaded)
     project = ROOT / 'reference/z5-qemu'
     build = json.loads((project / '.local/build-manifest.json').read_text())
     if hashlib.sha256(Path(build['binary']).read_bytes()).hexdigest() != build['binary_sha256']:
@@ -289,16 +408,26 @@ def main():
                '-chardev', f'file,id=z5uart,path={out / "uart.log"}', '-S',
                '-gdb', f'tcp:127.0.0.1:{port}', '-qmp', f'tcp:127.0.0.1:{qmp_port},server=on,wait=off',
                '-accel', 'tcg,thread=single', '-icount', 'shift=6,align=off,sleep=off']
+    from m0_baseline import inherited_qemu_environment
     state = dict(milestone='Q1', emulator_verified=False, camera_verified=False,
                  scatter_verified=False, kernel_start_seen=False, init_task_started=False,
                  tasks=[], events=[], firmware_sha256=firmware_sha256, firmware_modified=bool(patched_summary), patched_main=patched_summary,
                  host_ram_fixtures=[], hle_calls=[], command=command, build=build,
                  resource_limits=dict(address_space_mib=6144, host_cpu_count=2, nice=10),
+                 inherited_qemu_environment=inherited_qemu_environment(os.environ),
+                 skip_processing_init=args.skip_processing_init,
+                 q3_startup_assist=args.q3_startup_assist,
                  processing_init_standin=args.processing_init_standin,
                  display_budget_s=60 if 'Z5_RAW_INGRESS_TEST' in liveview_env else 30,
                  startup_environment_standin=args.startup_environment_standin,
                  application_ready_standin=args.application_ready_standin,
+                 startup_wait_standin=args.startup_wait_standin,
+                 shooting_ui_standin=args.shooting_ui_standin,
+                 i_menu_settings_standin=args.i_menu_settings_standin,
+                 zh_hans_standin=args.zh_hans_standin,
                  trace_error_producer=args.trace_error_producer,
+                 trace_calibration_loader=args.trace_calibration_loader,
+                 trace_card_context=args.trace_card_context,
                  capture_status_standin=args.capture_status_standin,
                  sensor_calibration_standin=args.sensor_calibration_standin,
                  sensor_reply_standin=args.sensor_reply_standin,
@@ -308,13 +437,25 @@ def main():
                  sensor_standin=args.sensor_standin,
                  card_standin=args.card_standin,
                  keep_awake=args.keep_awake,
+                 card_files=card_files, card_fail_opens=args.card_fail_opens,
+                 early_settings=[(int(k, 16), int(v)) for k, v in (x.split('=') for x in filter(None, args.early_settings.split(',')))],
+                 read_settings=[int(x, 16) for x in filter(None, args.read_settings.split(','))],
+                 write_settings=[(int(k, 16), int(v)) for k, v in (x.split('=') for x in filter(None, args.write_settings.split(',')))],
                  interactive_port=args.interactive_port or None,
                  interactive_minutes=args.interactive_minutes,
                  lv_background=str(args.lv_background.resolve()) if args.lv_background else None,
-                 liveview_hw_test=liveview_env or None,
+                 synthetic_calibration=str(args.synthetic_calibration.resolve()) if args.synthetic_calibration else None,
+                 liveview_hw_test={k: v for k, v in liveview_env.items() if k != 'Z5_SYNTHETIC_CALIBRATION'} or None,
                  q4_keys=q4_keys,
                  q4_require_change=args.q4_require_change,
+                 q4_menu_state=args.q4_menu_state or bool(menu_expected), q4_expect_menu=menu_expected,
+                 q4_expect_frames=frame_expected,
+                 q4_mailbox_probe=args.q4_mailbox_probe,
+                 mailbox_self_test=args.mailbox_self_test,
+                 q4_min_guest_ms=args.q4_min_guest_ms,
+                 q4_max_guest_ms=args.q4_max_guest_ms,
                  q4_trace_keys=args.q4_trace_keys,
+                 q4_trace_filter=trace_filter,
                  dump_ranges=[(int(a, 16), min(int(n, 16), 0x100000)) for a, n in (x.split(':') for x in filter(None, args.dump_ram.split(',')))],
                  q4_trace_pcs=[int(x, 16) for x in filter(None, args.q4_trace_pcs.split(','))],
                  assumptions=['Cortex-A15', 'CBAR 0x2C000000', 'GIC revision 1', '48 MHz timer',
@@ -325,6 +466,12 @@ def main():
         state.update(milestone='Q2-exploration', q1_verified=False, q2_verified=False,
                      task_trace=ledger.tasks, ui_loop=dict(verified=False), required_tasks=Q2_TASKS)
     points = dict(POINTS)
+    points.update(exception_trace_points(args.trace_error_producer))
+    if args.trace_calibration_loader:
+        points.update({pc: 'calibration_loader' for pc in CALIBRATION_TRACE_POINTS})
+    if args.trace_error_producer:
+        state['cpu_exceptions'] = []
+        state['cpu_exception_coverage'] = '0x10054680 from reset through Q3; other exception paths unverified'
     if args.trace_tasks:
         points[0x1003C064] = 'kernel_create_exit'
         points[0x10467BBE] = 'gui_loop_wait'
@@ -334,11 +481,13 @@ def main():
         points[0x102E0B70] = 'processing_init_skipped'
     proc = remote = monitor = None
     started = time.monotonic()
+    clean_env = dict(os.environ)
+    clean_env.pop('Z5_SYNTHETIC_CALIBRATION', None)
     with (out / 'qemu.log').open('x') as log:
         try:
             proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
                                     preexec_fn=limit_qemu_resources,
-                                    env=dict(os.environ, Z5_MMIO_QUIET='1',
+                                    env=dict(clean_env, Z5_MMIO_QUIET='1',
                                         **({'Z5_ALLOWED_MAIN_SHA256': firmware_sha256} if patched_summary else {}),
                                         **({'Z5_LCD_SCANOUT_TEST': '1'} if args.display else {}),
                                         **({'Z5_PROCESSING_INIT_STANDIN': '1'} if args.processing_init_standin else {}),
@@ -371,6 +520,12 @@ def main():
                 event = dict(pc=regs['r15'], thread=thread, name=points.get(pc, 'unexpected_stop'),
                              registers=regs, elapsed_seconds=round(time.monotonic() - started, 3))
                 state['events'].append(event)
+                if args.trace_calibration_loader and pc in CALIBRATION_TRACE_POINTS:
+                    row = observe_calibration(remote, regs, thread, 'boot')
+                    if row is not None:
+                        state.setdefault('calibration_loader_trace', []).append(row)
+                if pc == 0x10054680 and args.trace_error_producer:
+                    state['cpu_exceptions'].append(dict(phase='boot', thread=thread, registers=regs))
                 if pc not in active:
                     raise RuntimeError('stopped away from expected checkpoint')
                 if pc == 0x10445CB8 and args.display:
@@ -418,7 +573,8 @@ def main():
                         src, dst, size = row['source'], row['destination'], row['size']
                         if size:
                             actual = remote.memory(dst, size)
-                            equal = actual == image[src - BASE:src - BASE + size]
+                            # Initialized RAM is copied from the loaded image (verified patches included).
+                            equal = actual == loaded[src - BASE:src - BASE + size]
                             copies.append(dict(destination=f'0x{dst:08X}', size=size, matches=equal))
                     state['copied_ram_checks'] = copies
                     observed = [e['arguments'] for e in state['events'] if e['name'] == 'native_copy']
@@ -468,6 +624,8 @@ def main():
                         break
                 remote.command(f'z1,{pc:x},2')
                 repeat = pc in (0x10035708, 0x1003BD58, 0x1003C064)
+                repeat |= args.trace_calibration_loader and pc in CALIBRATION_TRACE_POINTS
+                repeat |= pc == 0x10054680 and args.trace_error_producer
                 if args.trace_tasks:
                     repeat |= (any(int(t['entry'], 16) & ~1 == pc for t in ledger.tasks) or
                                any(ret_pc == pc for ret_pc, _ in ledger.pending))
@@ -523,6 +681,8 @@ def main():
             import resource
             state['children_peak_rss_kib'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
             state['elapsed_seconds'] = round(time.monotonic() - started, 3)
+            from m0_baseline import observation_summary
+            state['observation_summary'] = observation_summary(state)
             with (out / 'result.json').open('x', encoding='utf-8') as report:
                 json.dump(state, report, indent=2)
                 report.write('\n')

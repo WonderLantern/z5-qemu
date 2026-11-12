@@ -10,13 +10,13 @@
 暗底加亮条；RGGB、黑电平 64、白电平 4095。不是传感器线协议，`camera_verified: false`。
 """
 import argparse
-from publication_paths import output_root
 import hashlib
 import json
 import struct
 import time
 import zlib
 from pathlib import Path
+from publication_paths import output_root
 
 ROOT = Path(__file__).resolve().parents[2]
 BLACK, WHITE = 64, 4095
@@ -101,8 +101,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--out', type=Path, help='new directory below output/ (default: timestamped)')
     a = p.parse_args()
-    out = (a.out or output_root() / f'qemu-raw-{time.strftime("%Y%m%d-%H%M%S")}').resolve()
-    if not out.is_relative_to(output_root()):
+    out = (a.out or ROOT / f'output/qemu-raw-{time.strftime("%Y%m%d-%H%M%S")}').resolve()
+    if not str(out).startswith(str(output_root())):
         p.error('output must be below output/')
     out.mkdir(parents=True, exist_ok=False)
     manifest = {}

@@ -9,6 +9,20 @@ import boot_probe
 
 
 class BootProbeTests(unittest.TestCase):
+    def test_exception_entry_is_watched_from_start_when_requested(self):
+        self.assertEqual(boot_probe.exception_trace_points(True), {0x10054680: 'cpu_exception_entry'})
+        self.assertEqual(boot_probe.exception_trace_points(False), {})
+
+    def test_native_initialization_uses_loaded_verified_image(self):
+        data = bytearray(0x10000)
+        offset = 0x1002C010 - boot_probe.BASE
+        struct.pack_into('<2I', data, offset, 0xc18f8120, 0x1144ab0)
+        for i, address in enumerate((0x1002C018, 0x1002C024, 0x1002C030)):
+            struct.pack_into('<3I', data, address - boot_probe.BASE, 0x12000000 + i, 0xc1800000 + i, 32 + i)
+        copies, zero_destination, zero_size = boot_probe.native_initialization_ranges(data)
+        self.assertEqual(copies[0]['size'], 32)
+        self.assertEqual((zero_destination, zero_size), (0xc18f8120, 0x1144ab0))
+
     def test_kernel_descriptor_name_is_at_0x30(self):
         data = bytearray(64)
         struct.pack_into('<5I', data, 0, 0, 0x41, 0x12340000, 7, 8192)

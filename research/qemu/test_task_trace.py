@@ -5,10 +5,19 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from task_trace import TaskLedger, gui_wait_evidence
+from task_trace import TaskLedger, gui_wait_evidence, task_from_stack
 
 
 class TaskTraceTests(unittest.TestCase):
+    def test_stack_match_requires_unique_observed_created_task(self):
+        a = dict(name='GUISRV', task_id=3, created=True, entry_observed=True,
+                 entry_stack_pointer='0xc2001000', stack_bytes=4096)
+        b = dict(a, name='other', task_id=4, entry_stack_pointer='0xc2003000')
+        self.assertEqual(task_from_stack([a, b], 0xc2000f00)['name'], 'GUISRV')
+        self.assertIsNone(task_from_stack([a, b], 0xc2001001))
+        self.assertIsNone(task_from_stack([a, dict(a, name='overlap')], 0xc2000f00))
+        self.assertIsNone(task_from_stack([dict(a, entry_observed=False)], 0xc2000f00))
+
     def task(self, name, exinf):
         return dict(name=name, entry='0x10232858', exinf=exinf, priority=5)
 

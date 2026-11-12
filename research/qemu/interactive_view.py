@@ -13,6 +13,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 
+def session_message(background, synthetic_i_settings, synthetic_chinese=False):
+    notes = []
+    if background:
+        notes.append('取景底图：主机合成参考图')
+    if synthetic_i_settings:
+        notes.append('i 菜单设置：模拟值，非相机实测')
+    if synthetic_chinese:
+        notes.append('简体中文：模拟会话')
+    return ' · '.join(notes)
+
+
 def ppm_to_png(data):
     """QEMU screendump PPM ("P6\\n<w> <h>\\n255\\n" + RGB) to PNG bytes."""
     magic, size, maxval, pixels = data.split(b'\n', 3)
@@ -48,23 +59,24 @@ button:hover{background:var(--keyhi)}button:active{background:var(--accent);colo
 kbd{background:var(--key);border-radius:4px;padding:0 4px}
 </style></head><body><main>
 <h1>Z5 模拟器（C 1.50，原厂固件）</h1>
-<p class="note">画面是模拟器 LCD 扫描输出；取景底图为主机合成的参考图，不是固件取景。按键经原厂 AO 入口发送。</p>
+<p class="note">画面是模拟器 LCD 扫描输出；取景底图为主机合成的参考图，不是固件取景。按键经原厂输入接口发送。</p>
 <div class="row">
 <div class="screen"><img id="lcd" alt="LCD" src="frame.png"></div>
 <div class="pad">
 <div class="side"><button data-k="menu">MENU</button><button data-k="i">i</button>
 <button data-k="disp">DISP</button><button data-k="help">帮助 ?</button>
 <button data-k="play">播放 ▶</button><button data-k="delete">删除 🗑</button>
-<button data-k="zoom_in">放大 ＋</button><button data-k="zoom_out">缩小 −</button></div>
+<button data-k="zoom_in">放大 ＋</button><button data-k="zoom_out">缩小 −</button>
+<button data-k="half_press" style="grid-column:span 2">半按快门 / 返回拍摄</button></div>
 <div class="grid"><span></span><button data-k="up">▲</button><span></span>
 <button data-k="left">◀</button><button data-k="ok">OK</button><button data-k="right">▶</button>
 <span></span><button data-k="down">▼</button><span></span></div>
 <div class="status" id="status">连接中…</div>
-<div class="status">键盘：方向键、<kbd>Enter</kbd>=OK、<kbd>M</kbd>=MENU、<kbd>I</kbd>=i、<kbd>D</kbd>=DISP、<kbd>H</kbd>=帮助、<kbd>P</kbd>=播放、<kbd>Del</kbd>=删除、<kbd>+</kbd>/<kbd>-</kbd>=放大/缩小</div>
+<div class="status">键盘：方向键、<kbd>Enter</kbd>=OK、<kbd>M</kbd>=MENU、<kbd>I</kbd>=i、<kbd>D</kbd>=DISP、<kbd>Esc</kbd>=半按快门、<kbd>H</kbd>=帮助、<kbd>P</kbd>=播放、<kbd>Del</kbd>=删除、<kbd>+</kbd>/<kbd>-</kbd>=放大/缩小</div>
 <button class="stop" id="stop" style="height:36px">结束会话</button>
 </div></div></main>
 <script>
-const keymap={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'ok',m:'menu',M:'menu',i:'i',I:'i',p:'play',P:'play',Delete:'delete',d:'disp',D:'disp','+':'zoom_in','=':'zoom_in','-':'zoom_out',h:'help',H:'help'};
+const keymap={ArrowUp:'up',ArrowDown:'down',ArrowLeft:'left',ArrowRight:'right',Enter:'ok',Escape:'half_press',m:'menu',M:'menu',i:'i',I:'i',p:'play',P:'play',Delete:'delete',d:'disp',D:'disp','+':'zoom_in','=':'zoom_in','-':'zoom_out',h:'help',H:'help'};
 function send(k){fetch('key?name='+k,{method:'POST'}).catch(()=>{});}
 document.querySelectorAll('button[data-k]').forEach(b=>b.onclick=()=>send(b.dataset.k));
 addEventListener('keydown',e=>{const k=keymap[e.key];if(k){e.preventDefault();send(k);}});

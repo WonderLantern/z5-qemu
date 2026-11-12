@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """用自建 ARM 循环核对：单步指定核时，另一核的寄存器必须保持不变。"""
 import argparse
-from publication_paths import output_root
 import hashlib
 import json
 from pathlib import Path
+from publication_paths import output_root
 import struct
 import subprocess
 import sys

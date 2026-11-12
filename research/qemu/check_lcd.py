@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from publication_paths import output_root
 import socket
 import subprocess
 import time
@@ -16,7 +17,7 @@ def main():
     parser.add_argument('--out', required=True, type=Path)
     args = parser.parse_args()
     out = args.out.resolve()
-    if out.exists() or not out.is_relative_to((ROOT / 'output').resolve()):
+    if out.exists() or not out.is_relative_to(output_root()):
         parser.error('--out must be a new shared output directory')
     out.mkdir(parents=True)
     build = json.loads((ROOT / 'reference/z5-qemu/.local/build-manifest.json').read_text())

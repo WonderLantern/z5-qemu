@@ -40,6 +40,7 @@ typedef struct NikonSerialSink {
 typedef struct NikonLabState {
     const NikonZ5Profile *model;
     MemoryRegion main_rom;
+    gchar *calibration_input;
     uint32_t processing_init_regs[0x1000 / 4];
     uint32_t processing_init_command;
     bool processing_init_ready;
@@ -2351,6 +2352,8 @@ static bool nikon_copy_access(NikonLabState *s, hwaddr addr, unsigned size,
             uint32_t *r = s->copy_regs[ch];
             uint64_t len = (uint64_t)r[0] + 1;
             bool source_ok = (r[1] >= 0x10000000 && (uint64_t)r[1] + len <= 0x12121000) ||
+                             (s->calibration_input && r[1] >= 0x13e80000 &&
+                              (uint64_t)r[1] + len <= 0x14000000) ||
                              nikon_copy_ram_range(r[1], len);
             if (r[3] != 0x30f00 || r[4] != 0x30f00 || r[5] != 0 ||
                 !source_ok || !nikon_copy_ram_range(r[2], len)) {
@@ -2658,6 +2661,56 @@ static size_t z5_lcd_overlay_coverage(uint32_t *r, unsigned w, unsigned h)
     return covered;
 }
 
+/* Test tool (off unless Z5_LCD_LAYER_DUMP names a directory): write each native
+ * overlay plane alone over black as PPM, only when its content changed, with
+ * the enabled region descriptors appended to regions.txt. Plane 0 is the GUI
+ * OSD, plane 1 the AF plane. Reads the same guest buffers as the scanout and
+ * changes nothing that is presented. */
+static void z5_lcd_layer_dump(uint32_t *r, unsigned frame, unsigned w, unsigned h)
+{
+    static const char *dir;
+    static bool checked;
+    static uint32_t last[2];
+    if (!checked) { checked = true; dir = getenv("Z5_LCD_LAYER_DUMP"); }
+    if (!dir || !*dir || w != 720 || h != 480) { return; }
+    for (unsigned plane = 0; plane < 2; plane++) {
+        g_autofree uint8_t *buf = g_malloc0((size_t)w * h * 4);
+        unsigned n = nikon_lcd_overlay(r, plane, buf, w * 4, w, h);
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i < (size_t)w * h * 4; i++) { hash = (hash ^ buf[i]) * 16777619u; }
+        hash ^= n;
+        if (hash == last[plane]) { continue; }
+        last[plane] = hash;
+        g_autofree char *path = g_strdup_printf("%s/f%06u-plane%u.ppm", dir, frame, plane);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", w, h);
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                uint32_t px = ldl_p(buf + i * 4);
+                uint8_t rgb[3] = {(px >> 16) & 255, (px >> 8) & 255, px & 255};
+                fwrite(rgb, 1, 3, f);
+            }
+            fclose(f);
+        }
+        g_autofree char *log = g_strdup_printf("%s/regions.txt", dir);
+        FILE *t = fopen(log, "a");
+        if (t) {
+            unsigned base = plane ? 0x3000 : 0x2000;
+            fprintf(t, "frame=%u plane=%u regions=%u enable=0x%x on=%u format=0x%x bank=%u\n", frame, plane, n,
+                    r[(base + 0x5c0)/4], r[(base + 0x110)/4] & 1, r[(base + 0x200)/4], (r[(base + 0x214)/4] >> 8) & 3);
+            for (unsigned region = 0; region < 10; region++) {
+                if (!(r[(base + 0x5c0)/4] & (1U << region))) { continue; }
+                uint32_t size = r[(base + 0x400)/4 + region], xy = r[(base + 0x580)/4 + region];
+                fprintf(t, "  region=%u x=%u y=%u w=%u h=%u color=0x%08x alpha=0x%08x\n", region,
+                        xy & 0xffff, (xy >> 16) & 0x3fff, size & 0xffff, (size >> 16) & 0x3fff,
+                        region ? r[(base + 0x47c)/4 + region] : r[(base + 0x440)/4 + ((r[(base + 0x214)/4] >> 8) & 3)],
+                        r[(base + 0x4c0)/4 + region]);
+            }
+            fclose(t);
+        }
+    }
+}
+
 static void nikon_lcd_present(void *opaque)
 {
     NikonLabState *s = opaque;
@@ -2757,6 +2810,12 @@ static void nikon_lcd_present(void *opaque)
             invalid_af_input = cx2 == 0 && cy2 == 0;
         }
     }
+    /* Test tool: Z5_AF_PLANE_SHOW=1 scans the AF plane out even without an AF
+     * position producer, to see what the firmware left in it. Off by default. */
+    if (invalid_af_input && getenv("Z5_AF_PLANE_SHOW") && *getenv("Z5_AF_PLANE_SHOW") == '1') {
+        invalid_af_input = false;
+    }
+    z5_lcd_layer_dump(r, s->lcd_frames, w, h);
     unsigned overlay2=invalid_af_input ? 0 :
         nikon_lcd_overlay(r,1,out,surface_stride(surface),w,h);
     nikon_lcd_grid(r, out, surface_stride(surface), w, h);
@@ -3348,6 +3407,14 @@ static uint64_t nikon_unknown_read(void *opaque, hwaddr addr, unsigned size)
         nikon_mmio_trace(addr, size, false, s->channel_control[2]);
         return s->channel_control[2];
     }
+    if (s->calibration_input && addr >= 0x13e80000 &&
+        addr + size <= 0x14000000 && size <= 8) {
+        uint64_t value = 0;
+        for (unsigned i = 0; i < size; i++) {
+            value |= (uint64_t)(uint8_t)s->calibration_input[addr - 0x13e80000 + i] << (8 * i);
+        }
+        return value;
+    }
     if (s->recovery_profile && addr >= 0x12121000 && addr + size <= 0x14000000) {
         fill_value = size == 4 ? UINT32_MAX : ((UINT64_C(1) << (size * 8)) - 1);
         nikon_mmio_trace(addr, size, false, fill_value);
@@ -3547,6 +3614,24 @@ static void nikon_z5_init(MachineState *machine)
     NikonLabState *s = g_new0(NikonLabState, 1);
     s->model = &nikon_z5_profile;
     s->z5_profile = true;
+    const char *calibration_path = getenv("Z5_SYNTHETIC_CALIBRATION");
+    if (calibration_path) {
+        gsize calibration_len = 0;
+        GError *calibration_error = NULL;
+        if (!g_file_get_contents(calibration_path, &s->calibration_input,
+                                 &calibration_len, &calibration_error)) {
+            error_report("Cannot read synthetic calibration: %s", calibration_error->message);
+            exit(1);
+        }
+        g_autofree gchar *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+            (const guchar *)s->calibration_input, calibration_len);
+        if (calibration_len != 0x180000 || g_strcmp0(digest,
+            "2500f5782cca0407d00dc525a2e9b565e4a94838cfe8d986a01c2f526e9fbc50")) {
+            error_report("Synthetic calibration profile mismatch");
+            exit(1);
+        }
+        fprintf(stderr, "Z5_SYNTHETIC_CALIBRATION size=0x180000 assumption_only=1\n");
+    }
     s->boot_profile = boot_profile;
     s->platform_profile = platform_profile;
     s->driver_fifo_depth = driver_fifo_depth;

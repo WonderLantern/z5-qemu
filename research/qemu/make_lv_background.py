@@ -5,11 +5,11 @@
 `--rgb` 可改用已转换好的 720x480 RGB24 文件（例如用 convert_lv_background.ps1 从照片转换）。
 """
 import argparse
-from publication_paths import output_root
 import hashlib
 import json
 import time
 from pathlib import Path
+from publication_paths import output_root
 
 from make_z5_raw import png, scene_row, srgb8
 
@@ -34,8 +34,8 @@ def main():
     data = a.rgb.read_bytes() if a.rgb else color_bars()
     if len(data) != SIZE:
         p.error(f'background must be {SIZE} bytes (720x480 RGB24)')
-    out = (a.out or output_root() / f'qemu-lvbg-{time.strftime("%Y%m%d-%H%M%S")}').resolve()
-    if not out.is_relative_to(output_root()):
+    out = (a.out or ROOT / f'output/qemu-lvbg-{time.strftime("%Y%m%d-%H%M%S")}').resolve()
+    if not str(out).startswith(str(output_root())):
         p.error('output must be below output/')
     out.mkdir(parents=True, exist_ok=False)
     (out / 'background.rgb').write_bytes(data)

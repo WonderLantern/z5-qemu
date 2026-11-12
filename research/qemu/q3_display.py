@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Q3 原厂绘制诊断；图像只来自 QMP，不由宿主补画界面。"""
 import hashlib
+from pathlib import Path
 import signal
 import socket
 import struct
 import time
 import zlib
+from calibration_trace import POINTS as CALIBRATION_TRACE_POINTS, observe as observe_calibration
+from key_input import KEYS as Q4_KEYS, key_metadata, press_key
+from shooting_ui import (ensure_ready as ensure_shooting_ui_ready, ensure_i_menu_settings,
+                         sync_quality_mirror, enable_simplified_chinese, snapshot as shooting_ui_snapshot)
 
 # --trace-error-producer only: return addresses of the status sub-calls OR'd by
 # FUN_1011e1e4 / FUN_1011deb0 / FUN_1011fe96 (the device-status word that
@@ -57,11 +62,9 @@ STANDBY_STATE, STANDBY_RECOMPUTE = 0xC1819254, 0x1008D790
 # --q4-keys: native AO key indices (C1.50 AO table 0x1072FE84, 16-byte entries
 # {enabled, bank, group, mask}); masks matched to the ID_SW name table
 # (40-byte entries, ID_SW1_MENU at 0x107375B8).  Same indices as the Z7 emulator.
-# disp/help/zoom: matched by (bank, group, mask) to ID_SW1_INFO (the Z5 DISP
-# button keeps the DSLR name), ID_SW1_HELP, ID_SW1_ZOOM and ID_SW1_THUMBNAIL.
-Q4_KEYS = {'right': 34, 'left': 35, 'up': 36, 'down': 37,
-           'menu': 67, 'play': 68, 'delete': 69, 'i': 72, 'ok': 74,
-           'help': 70, 'disp': 71, 'zoom_in': 75, 'zoom_out': 76}
+# DISP is ID_SW2_DISP (group2, mask100000), absent from the AO table.
+# key_input submits a preserved native switch snapshot for it; AO71/INFO
+# produces action15, whereas the Z5 DISP key must produce action29.
 # --trace-error-producer (open lead, see handoff): with --liveview-hw-test tg the
 # guest stops at ~23.4 s on an unmodeled NOR flash command write 0x10000AAA=0xAA
 # from RAM 0xC2A9065A (flash routines copied from ROM 0x1211C100 to 0xC2A90000;
@@ -82,11 +85,29 @@ CAPTURE_INFO_POINTS = (0x10071E1C, 0x10071E22)
 CAPTURE_STATUS_SETTER = 0x10184C96
 CARD_MEDIA_STATUS = 0x102ABFC2
 CARD_NO_MEDIA = 1
+# --card-file: host-backed card files for the SDK/loader file calls (bind stores the path at fobj+0;
+# open/read/close below are the functions the stage0 loader and the SDK call).
+FS_OPEN, FS_READAT, FS_CLOSE = 0x1033A82E, 0x1020B0DE, 0x1033A8BA
+FS_WRITE = 0x102CB162            # (handle at fobj+8, data, length, &written)
+FS_CREATE_MODE = 0x30A
+FS_OPEN_MISSING = 0xFFFFFFFF      # stand-in answer for an unmapped A:\ path
+FS_OPEN_OK = 0x043A0080
 SENSOR_ERROR_CODES = set(range(0x34, 0x37)) | set(range(0x3E, 0x45))
 SENSOR_CALIBRATION_CHECK = 0x101401B6
 TG_CONTROL_WRITES = (0x1012B046, 0x1012B04C, 0x1012B07A, 0x1012B082)
 CSEQ_SENSOR_POINTS = (0x10205528, 0x10205570, 0x10205582, 0x10205586, 0x10208772, 0x102087AA,
-                      0x10121D6C, 0x1005929E, 0x100592AA, 0x1027AC32, 0x1027AD3E, 0x1005944E)
+                      0x10121D6C, 0x1005929E, 0x100592AA, 0x1027AC32, 0x1027AD3E, 0x1005944E,
+                      0x1012051E, 0x1012054E)  # sensor callback and flag-8 producer branch
+
+
+def reserve_sensor_trace_record(counts, pc, limit=256):
+    """Bound each trace point independently so hot dispatches cannot hide requests."""
+    key = hex(pc)
+    count = counts.get(key, 0)
+    if count >= limit:
+        return False
+    counts[key] = count + 1
+    return True
 
 
 def sensor_error_suppressed(code, calibration_standin, reply_standin=False, expose_3f=False):
@@ -140,8 +161,122 @@ def q3_accepted(frame, native_draw_seen, lcd_scanout_seen):
     return bool(frame['nonuniform'] and native_draw_seen and lcd_scanout_seen)
 
 
-def q4_frame_settled(previous, hashes, nonuniform, require_change):
-    return bool(len(hashes) >= 2 and hashes[-1] == hashes[-2] and nonuniform and
+def guest_elapsed_ms(start, current):
+    return (current - start) & 0xffffffff
+
+
+def q4_guest_budget_ok(start, current, maximum):
+    return guest_elapsed_ms(start, current) <= maximum
+
+
+def prepare_q3_startup(enabled, remote, call, run_to):
+    """Run the legacy host-started display sequence only when opted in."""
+    if enabled:
+        configuration = call('native_image_pool_configuration', 0x10152DDC, bytes(12), [2, 0, ('scratch', 0)])
+        call('native_image_pool_init', 0x10141696, bytes.fromhex(configuration['output']), [('scratch', 0)])
+        run_to(0x100531BC)
+        call('diagnostic_power_report', 0x10233F7C, bytes(72), [0x43090010, ('scratch', 0)])
+        report = bytes.fromhex('000100000200000000000000000000000000000002000000000000000000000000000000')
+        call('diagnostic_system_report', 0x10058D18, report, [0x03040002, ('scratch', 0)])
+        run_to(0x102AF134)
+        power = bytearray(remote.memory(0xC1F995C4, 0x34))
+        struct.pack_into('<I', power, 0, struct.unpack_from('<I', power)[0] | 0x200)
+        call('diagnostic_control_power_on', 0x101ED678, bytes(power), [('scratch', 0)])
+    run_to(0x100531BC)
+
+
+def decode_native_menu_page(data):
+    """Decode fields used by the C1.50 1047897a page event router."""
+    if len(data) < 0x2c:
+        raise ValueError('short native menu page')
+    field_16, field_18 = struct.unpack_from('<HH', data, 0x16)
+    return dict(page_id=struct.unpack_from('<H', data, 2)[0], field_16=field_16,
+                field_18=field_18, row=field_16 + field_18,
+                header=hex(struct.unpack_from('<I', data, 0x28)[0]))
+
+
+def native_menu_snapshot(remote):
+    """Read the page-stack layout used by 10451f3e without invoking guest code."""
+    def valid(address, size):
+        return 0xC1800000 <= address <= 0xCD800000 - size and not address % 4
+    stack = struct.unpack('<I', remote.memory(0xC181DFD0, 4))[0]
+    if not valid(stack, 16):
+        return dict(status='invalid', stack=hex(stack))
+    stride, _, count, base = struct.unpack('<IIII', remote.memory(stack, 16))
+    if not count:
+        return dict(status='empty', stack=hex(stack), count=0)
+    if not 4 <= stride <= 0x100 or stride % 4 or count > 256 or not valid(base, count * stride):
+        return dict(status='invalid', stack=hex(stack), count=count)
+    page = struct.unpack('<I', remote.memory(base + (count - 1) * stride, 4))[0]
+    if not valid(page, 0x2c):
+        return dict(status='invalid', stack=hex(stack), count=count, page_pointer=hex(page))
+    return dict(status='ok', stack=hex(stack), count=count, page_pointer=hex(page),
+                page=decode_native_menu_page(remote.memory(page, 0x2c)))
+
+
+def menu_expectation_met(expected, snapshot):
+    if expected is None:
+        return True
+    return (snapshot is not None and snapshot.get('status') == 'ok' and
+            (snapshot['page']['page_id'], snapshot['page']['row']) == tuple(expected))
+
+
+def frame_expectation_met(expected, actual):
+    return expected is None or expected == actual
+
+
+def parse_frame_expectations(value, count):
+    items = value.split(',')
+    if len(items) != count:
+        raise ValueError('expected one fingerprint per expanded key')
+    result = []
+    for item in items:
+        if item == '*':
+            result.append(None)
+        elif len(item) == 64 and all(c in '0123456789abcdef' for c in item):
+            result.append(item)
+        else:
+            raise ValueError('fingerprints must be lowercase SHA-256 or *')
+    return result
+
+
+def card_open_policy(path, mode, mapped, fail_opens):
+    """Only explicitly mapped files may be handled by the host fixture."""
+    path = path.upper()
+    if path not in mapped:
+        return 'stock'
+    if fail_opens > 0 and path.startswith('A:\\SHUTTER\\'):
+        return 'fail'
+    return 'create' if mode == FS_CREATE_MODE else 'mapped'
+
+
+def startup_wait_action(enabled, pending, index):
+    """Return the legacy diagnostic action only for an explicitly enabled known wait."""
+    if not enabled:
+        return None
+    if index == 2:
+        if pending[2] == 0:
+            return None
+        if pending[2] == 0x40 and pending[3] == 4:
+            return (2, 0x40)
+    elif index == 0:
+        if pending[0] == 0:
+            return None
+        if pending[0] == 2:
+            return (0, 2)
+    raise ValueError(f'unexpected startup wait state at index {index}: {pending!r}')
+
+
+def trace_register_matches(filter_spec, regs):
+    if filter_spec is None:
+        return True
+    return filter_spec['start'] <= int(regs[filter_spec['register']], 16) < filter_spec['end']
+
+
+def q4_frame_settled(previous, hashes, nonuniform, require_change, elapsed_ms=0, min_guest_ms=0):
+    # Visual stability after a minimum observation window; this does not prove
+    # that native asynchronous page work is idle.
+    return bool(elapsed_ms >= min_guest_ms and len(hashes) >= 2 and hashes[-1] == hashes[-2] and nonuniform and
                 (not require_change or hashes[-1] != previous))
 
 
@@ -154,6 +289,24 @@ def checked_ram_fixture(remote, records, reason, address, before, after):
         raise RuntimeError('guest RAM fixture rejected')
     records.append(dict(kind='synthetic guest RAM fixture', reason=reason, address=hex(address),
                         before=before.hex(), after=after.hex()))
+
+
+def validate_startup_environment(threshold, thermal_limit, measurement, thermal, fault):
+    """Accept only the C1.50 UI fixture values observed in the frozen baseline."""
+    if (threshold, thermal_limit, measurement, thermal, fault) != (
+            0, 0, b'\0\0', b'\0\0', b'\x01\0\0\0'):
+        raise ValueError('unexpected startup environment values; refusing synthetic fixtures')
+    return struct.pack('<h', threshold + 1), struct.pack('<h', thermal_limit - 1)
+
+
+def write_observed_setting(call, prefix, key, value):
+    before = call(f'{prefix}_read_{key:04x}', SETTING_READ, bytes(4), [key]).get('return_r0')
+    if before is None:
+        raise ValueError('setting read before write did not return a value')
+    result = call(f'{prefix}_write_{key:04x}', SETTING_WRITE, bytes(4), [key, value]).get('return_r0')
+    after = call(f'{prefix}_check_{key:04x}', SETTING_READ, bytes(4), [key]).get('return_r0')
+    return dict(op='early_write' if prefix == 'early' else 'write', key=hex(key), value=value,
+                before=before, result=result, after=after)
 
 
 def apply_capture_status_standin(remote, records):
@@ -186,6 +339,7 @@ def capture(monitor, out, name):
 
 def run_display(remote, monitor, state, out, image):
     from boot_probe import stop_thread, forced_failure_registers
+    from task_trace import task_from_stack
     import probe
     state.update(milestone='Q3-exploration', q3_verified=False, emulator_verified=False)
     frame = capture(monitor, out, 'pre-display-baseline')
@@ -257,9 +411,34 @@ def run_display(remote, monitor, state, out, image):
         state['error_text_constructs'] = []
         state['error_text_construct_hits'] = 0
         state['message_sends'] = []
+    if state.get('trace_calibration_loader'):
+        watches.update({pc: 'calibration_loader' for pc in CALIBRATION_TRACE_POINTS})
     if state.get('card_standin'):
         state['card_standin_records'] = []
         watches[CARD_MEDIA_STATUS] = 'card_media_status'
+    if state.get('card_files'):
+        state['card_file_log'], state['card_file_open'] = [], {}
+        card_data = {name: Path(info['host']).read_bytes() for name, info in state['card_files'].items()}
+        state['card_file_writes'], handles = {}, {}
+        watches.update({FS_OPEN: 'fs_open', FS_READAT: 'fs_readat', FS_CLOSE: 'fs_close', FS_WRITE: 'fs_write'})
+    if state.get('trace_card_context'):
+        # Follow the callback literals, so both stock and verified patched MAIN
+        # are observed at the actual entry, before any loader file call.
+        draw_points = {}
+        for cls, literal in ((0, 0x104B2224), (4, 0x10386D20)):
+            target = struct.unpack('<I', remote.memory(literal, 4))[0]
+            if not target & 1 or not 0x10020000 <= target < 0x12200000:
+                raise ValueError(f'unexpected class {cls} callback {target:#x}')
+            draw_points[target & ~1] = cls
+            watches[target & ~1] = f'card_draw_class_{cls}'
+        if len(draw_points) != 2:
+            raise ValueError('class 0 and class 4 callbacks unexpectedly overlap')
+        state['card_context_draw_targets'] = {str(v): hex(k) for k, v in draw_points.items()}
+        state['card_context_draws'] = []
+        state['card_context_draw_counts'] = {}
+        state['card_context_phase'] = 'display_setup'
+    else:
+        draw_points = {}
     if state.get('sensor_standin'):
         state['sensor_standin_records'] = []
         watches[SENSOR_ERROR_REPORT] = 'sensor_error_report'
@@ -270,6 +449,79 @@ def run_display(remote, monitor, state, out, image):
     # Shared host budget for the whole display stage. Device models that log
     # every frame (RAW input) slow the guest, so the probe may raise it.
     deadline = time.monotonic() + state.get('display_budget_s', 30)
+
+    def card_context(regs, thread):
+        result = dict(phase=state.get('card_context_phase'), cpu_thread=thread,
+                      guest_ms=struct.unpack('<I', remote.memory(0xC18EB388, 4))[0],
+                      page_word=hex(struct.unpack('<I', remote.memory(0xC1819F90, 4))[0]),
+                      ui=shooting_ui_snapshot(remote), sp=regs['r13'])
+        # A host fixture borrows a stopped CPU and is not evidence of task identity.
+        result['task'] = task_from_stack(state.get('task_trace', []), int(regs['r13'], 16)) if thread else None
+        result['execution'] = 'guest' if thread else 'host fixture or unspecified'
+        return result
+
+    def card_file_call(pc, regs, thread):
+        # Diagnostic card model for named files only; every other path runs the stock code.
+        opened, log = state['card_file_open'], state['card_file_log']
+        fobj = int(regs['r0'], 16)
+        def passthrough(reason, **details):
+            if state.get('trace_card_context'):
+                log.append(dict(function=hex(pc), fobj=hex(fobj), lr=regs['r14'],
+                                note=reason, context=card_context(regs, thread), **details))
+            return False
+        def finish(value, **row):
+            record = dict(function=hex(pc), fobj=hex(fobj), result=hex(value), lr=regs['r14'], **row)
+            if state.get('trace_card_context'):
+                record['context'] = card_context(regs, thread)
+            log.append(record)
+            if len(log) > 4000:
+                raise RuntimeError('card file stand-in repeated; stop instead of hiding a loop')
+            if remote.command('G' + forced_failure_registers(regs, value).hex()) != 'OK':
+                raise RuntimeError('card file stand-in rejected')
+            return True
+        if pc == FS_OPEN:
+            path_ptr = struct.unpack('<I', remote.memory(fobj, 4))[0]
+            if not 0xC0000000 <= path_ptr < 0xE0000000 and not 0x10020000 <= path_ptr < 0x12200000:
+                return passthrough('stock path: unsupported path pointer')
+            raw = remote.memory(path_ptr, 96).split(b'\x00', 1)[0]
+            path = raw.decode('ascii', 'replace').upper()
+            mode = int(regs['r1'], 16)
+            policy = card_open_policy(path, mode, card_data, state.get('card_fail_opens', 0))
+            if policy == 'stock':
+                return passthrough('stock path: not mapped', path=path, mode=hex(mode))
+            if policy == 'fail':
+                state['card_fail_opens'] -= 1            # card not ready yet (diagnostic)
+                return finish(FS_OPEN_MISSING, path=path, mode=hex(mode), note='injected failure')
+            if policy == 'create':
+                card_data[path] = b''                    # create or truncate, kept in host memory
+                state['card_file_writes'][path] = ''
+            opened[fobj] = path
+            handle = 0x7F000000 | (len(log) & 0xFFFF)
+            handles[handle] = path
+            assert remote.command(f'M{fobj + 8:x},4:' + struct.pack('<I', handle).hex()) == 'OK'
+            return finish(FS_OPEN_OK, path=path, mode=hex(mode))
+        if pc == FS_WRITE:
+            path = handles.get(fobj)
+            if path is None:
+                return passthrough('stock path: untracked write handle')
+            src, length, out = (int(regs[r], 16) for r in ('r1', 'r2', 'r3'))
+            data = remote.memory(src, length) if length else b''
+            card_data[path] += data
+            state['card_file_writes'][path] = card_data[path].hex()
+            if out:
+                assert remote.command(f'M{out:x},4:' + struct.pack('<I', length).hex()) == 'OK'
+            return finish(0, path=path, length=length)
+        if fobj not in opened:
+            return passthrough('stock path: untracked file object')
+        if pc == FS_CLOSE:
+            path = opened.pop(fobj)
+            return finish(0, path=path)
+        dst, offset, length = (int(regs[r], 16) for r in ('r1', 'r2', 'r3'))
+        data = card_data[opened[fobj]][offset:offset + length]
+        for start in range(0, len(data), 1024):
+            chunk = data[start:start + 1024]
+            assert remote.command(f'M{dst + start:x},{len(chunk):x}:' + chunk.hex()) == 'OK'
+        return finish(len(data), path=opened[fobj], offset=offset, length=length)
 
     def processing_failure(connection, regs):
         if len(state['hle_calls']) >= 8:
@@ -282,6 +534,28 @@ def run_display(remote, monitor, state, out, image):
 
     def observe(regs, thread=None):
         pc = int(regs['r15'], 16)
+        if state.get('trace_calibration_loader') and pc in CALIBRATION_TRACE_POINTS:
+            row = observe_calibration(remote, regs, thread, 'display')
+            if row is not None:
+                state.setdefault('calibration_loader_trace', []).append(row)
+            return
+        if pc in draw_points:
+            phase = state['card_context_phase']
+            key = f'{phase}:class{draw_points[pc]}'
+            counts = state['card_context_draw_counts']
+            counts[key] = counts.get(key, 0) + 1
+            # Counts remain complete while individual samples are bounded per phase.
+            if counts[key] <= 32:
+                widget = int(regs['r0'], 16)
+                element = None
+                if 0xC0000000 <= widget <= 0xCD800000 - 12:
+                    element = hex(struct.unpack('<I', remote.memory(widget + 8, 4))[0])
+                state['card_context_draws'].append(dict(draw_class=draw_points[pc],
+                    element=element, lr=regs['r14'], context=card_context(regs, thread)))
+            if pc in (0x104B1F58, 0x103864E0) and len(state['display_events']) < 256:
+                state['display_events'].append(dict(name='native_widget_draw' if draw_points[pc] == 0 else
+                    'native_text_widget_draw', pc=hex(pc), thread=thread, registers=regs))
+            return
         if pc in CSEQ_SENSOR_POINTS and state.get('trace_error_producer'):
             if pc == 0x1005944E and int(regs['r6'], 16) != state.get('cseq_request_address'):
                 return
@@ -290,7 +564,7 @@ def run_display(remote, monitor, state, out, image):
                 if not 0xC0000000 <= address < 0xCD800000 or remote.memory(address, 1) != b'\x02':
                     return
             rows = state.setdefault('cseq_sensor_steps', [])
-            if len(rows) < 256:
+            if reserve_sensor_trace_record(state.setdefault('cseq_sensor_trace_counts', {}), pc):
                 row = dict(pc=hex(pc), thread=thread, ms=struct.unpack('<I', remote.memory(0xC18EB388, 4))[0], registers=regs)
                 if pc == 0x10121D6C:
                     table = struct.unpack('<I', remote.memory(0xC18E6490, 4))[0]
@@ -360,6 +634,9 @@ def run_display(remote, monitor, state, out, image):
                 ms=struct.unpack('<I', remote.memory(0xC18EB388, 4))[0],
                 stack_code=[hex(w) for w in words if w & 1 and 0x10020000 <= w < 0x12120000][:20]))
             return
+        if state.get('card_files') and pc in (FS_OPEN, FS_READAT, FS_CLOSE, FS_WRITE):
+            if card_file_call(pc, regs, thread):
+                return
         if state.get('card_standin') and pc == CARD_MEDIA_STATUS:
             records = state['card_standin_records']
             records.append(dict(kind='forced return; native body skipped', function=hex(pc),
@@ -500,27 +777,34 @@ def run_display(remote, monitor, state, out, image):
                 if 0xC0000000 <= pointer < 0xCD800000:
                     row['message'] = remote.memory(pointer, 68).hex()
             if state.get('q4_trace_active'):
+                if watches[pc].startswith('trace_') and not trace_register_matches(state.get('q4_trace_filter'), regs):
+                    return
                 row['guest_ms'] = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
                 event = {k: row[k] for k in ('name', 'guest_ms', 'message') if k in row} | {'r0': regs['r0'], 'r1': regs['r1']}
                 if watches[pc].startswith('trace_'):
                     event['registers'] = {k: regs[k] for k in ('r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r14')}
+                    if pc == 0x1047897A:
+                        page = int(regs['r0'], 16)
+                        if 0xC1800000 <= page <= 0xCD800000 - 0x2c:
+                            event['native_page'] = decode_native_menu_page(remote.memory(page, 0x2c))
                     stack = remote.memory(int(regs['r13'], 16), 0x100)
                     event['stack_code'] = [hex(w) for w in struct.unpack('<64I', stack)
                                            if w & 1 and 0x10020000 <= w < 0x12120000][:12]
                 state['q4_trace'][-1]['events'].append(event)
-                if len(state['q4_trace'][-1]['events']) >= (150 if state.get('q4_trace_pcs') else 40):
+                cap = 2048 if state.get('q4_trace_filter') else 150 if state.get('q4_trace_pcs') else 40
+                if len(state['q4_trace'][-1]['events']) >= cap:
                     state['q4_trace_active'] = False      # bound the trace per press
                 return
             state['display_events'].append(row)
 
-    def call(name, function, payload, arguments, timeout=10):
+    def call(name, function, payload, arguments, timeout=10, thumb=True):
         remote.sock.settimeout(timeout)
         packet = remote.command('?')
         row = dict(name=name, function=hex(function), completed=False)
         state['q3_calls'].append(row)
         try:
-            result = probe.call_fixture(adapter, packet, function, payload, arguments,
-                services={} if state.get('processing_init_standin') else {0x102E0B70: processing_failure},
+            result = probe.call_fixture(adapter, packet, function, payload, arguments, thumb=thumb,
+                services={0x102E0B70: processing_failure} if state.get('skip_processing_init') else {},
                 observers={pc: (lambda connection, regs: observe(regs)) for pc in watches})
         except Exception:
             row['incomplete_fixture'] = probe.ACTIVE_FIXTURE
@@ -546,7 +830,7 @@ def run_display(remote, monitor, state, out, image):
             reply = remote.command('vCont;s:' + thread)
             if stop_thread(reply) != thread: raise RuntimeError('wrong CPU stepped')
         points = set(watches) | {address}
-        if not state.get('processing_init_standin'): points.add(0x102E0B70)
+        if state.get('skip_processing_init'): points.add(0x102E0B70)
         for pc in points: remote.command(f'Z1,{pc:x},2')
         # Opt-in: write watchpoint on the shooting-screen status array whose first
         # byte item 10 shows ("Err" for codes 0x21/0x22). Record writer and value.
@@ -592,7 +876,8 @@ def run_display(remote, monitor, state, out, image):
             remote.command(f'z1,{pc:x},2')
             reply = remote.command('vCont;s:' + thread)
             if stop_thread(reply) != thread: raise RuntimeError('wrong CPU stepped')
-            if len(state['display_events']) < 256: remote.command(f'Z1,{pc:x},2')
+            if len(state['display_events']) < 256 or pc in draw_points or (state.get('card_files') and pc in (FS_OPEN, FS_READAT, FS_CLOSE, FS_WRITE)):
+                remote.command(f'Z1,{pc:x},2')
             else: points.remove(pc)
         raise TimeoutError('Q3 display execution budget exhausted')
 
@@ -608,18 +893,10 @@ def run_display(remote, monitor, state, out, image):
             if name == 'output-04': state['status_watch_armed'] = False
         state['frames'].append(frame)
 
-    configuration = call('native_image_pool_configuration', 0x10152DDC, bytes(12), [2, 0, ('scratch', 0)])
-    payload = bytes.fromhex(configuration['output'])
-    call('native_image_pool_init', 0x10141696, payload, [('scratch', 0)])
-    run_to(0x100531BC)
-    call('diagnostic_power_report', 0x10233F7C, bytes(72), [0x43090010, ('scratch', 0)])
-    report = bytes.fromhex('000100000200000000000000000000000000000002000000000000000000000000000000')
-    call('diagnostic_system_report', 0x10058D18, report, [0x03040002, ('scratch', 0)])
-    run_to(0x102AF134)
-    power = bytearray(remote.memory(0xC1F995C4, 0x34))
-    struct.pack_into('<I', power, 0, struct.unpack_from('<I', power)[0] | 0x200)
-    call('diagnostic_control_power_on', 0x101ED678, bytes(power), [('scratch', 0)])
-    run_to(0x100531BC)
+    prepare_q3_startup(state.get('q3_startup_assist', False), remote, call, run_to)
+    for key, value in state.get('early_settings', []):
+        # Diagnostic: stock setting write before the GUI builds (e.g. language 0x1400).
+        state.setdefault('setting_probe', []).append(write_observed_setting(call, 'early', key, value))
     if state.get('startup_environment_standin'):
         records = state.setdefault('startup_environment_fixtures', [])
         config = struct.unpack('<I', remote.memory(0xC1807E34, 4))[0]
@@ -631,21 +908,24 @@ def run_display(remote, monitor, state, out, image):
         measurement = remote.memory(0xC1D4AB2A, 2)
         state['startup_measurement'] = dict(configuration=hex(config), threshold=threshold,
                                           original_measurement=measurement.hex())
-        if threshold >= 32767: raise ValueError('cannot construct in-range startup measurement')
-        checked_ram_fixture(remote, records, 'ADC0 above native startup minimum; synthetic measurement',
-                            0xC1D4AB2A, measurement, struct.pack('<h', threshold + 1))
         thermal_limit = struct.unpack('<h', remote.memory(config + 0x2c, 2))[0]
-        if thermal_limit <= -32768: raise ValueError('cannot construct in-range thermal measurement')
+        thermal = remote.memory(0xC1D4AB10, 2)
+        fault = remote.memory(0xC18A45F0, 4)
+        state['startup_fault_before'] = fault.hex()
         state['startup_thermal_measurement'] = dict(threshold=thermal_limit,
-            original_measurement=remote.memory(0xC1D4AB10, 2).hex())
+            original_measurement=thermal.hex())
+        adc_target, thermal_target = validate_startup_environment(threshold, thermal_limit, measurement, thermal, fault)
+        checked_ram_fixture(remote, records, 'ADC0 above native startup minimum; synthetic measurement',
+                            0xC1D4AB2A, measurement, adc_target)
         checked_ram_fixture(remote, records, 'temperature below native startup maximum; synthetic measurement',
-                            0xC1D4AB10, remote.memory(0xC1D4AB10, 2), struct.pack('<h', thermal_limit - 1))
+                            0xC1D4AB10, thermal, thermal_target)
         checked_ram_fixture(remote, records, 'settings initialization fault flag; no persistent storage modeled',
-                            0xC18A45F0, b'\x01\0\0\0', bytes(4))
+                            0xC18A45F0, fault, bytes(4))
     # C1.50 02000003 -> interface+18 (100699ae): completes the power report.
     # Unlike notification02000001, this sender copies the full word parameter.
-    call('native_application_start_complete', 0x1005D3B4, bytes(8), [0xC18183AC, 0])
-    run_to(0x100531BC)
+    if state.get('q3_startup_assist'):
+        call('native_application_start_complete', 0x1005D3B4, bytes(8), [0xC18183AC, 0])
+        run_to(0x100531BC)
     if state.get('application_ready_standin'):
         # C1.50 APPCTL group2 jump table: 04 -> caf0 (ready bit2),
         # 05 -> cb2e (ready bit1). Follow d138's pool-copy/send sequence.
@@ -667,7 +947,7 @@ def run_display(remote, monitor, state, out, image):
         callback=hex(struct.unpack_from('<I', app_data, 0x90)[0]))
     pending = struct.unpack_from('<4I', app_data, 0x328)
     state['startup_wait_overrides'] = []
-    if pending[2] == 0x40 and pending[3] & 4:
+    if startup_wait_action(state.get('startup_wait_standin', False), pending, 2):
         override = dict(kind='explicit startup readiness wait bypass', address='0xC18186DC',
                         index=2, expected_mask='0x40', before=state['app_sync_before_menu'],
                         reason='service bit6 has not completed in the emulator; display-only assistance')
@@ -682,7 +962,7 @@ def run_display(remote, monitor, state, out, image):
         state['app_settle'].append(dict(interface=hex(interface), mode=data[0x158:0x15c].hex(),
             synchronization=[hex(x) for x in struct.unpack_from('<4I', data, 0x328)]))
         if interface != 0xC1819004: break
-    if struct.unpack_from('<I', data, 0x328)[0] == 2:
+    if startup_wait_action(state.get('startup_wait_standin', False), struct.unpack_from('<4I', data, 0x328), 0):
         override = dict(kind='explicit initial readiness wait bypass', address='0xC18186D4',
                         index=0, expected_mask='0x2', before=data[0x328:0x338].hex(),
                         reason='initial app readiness bit1 remains pending; display-only assistance')
@@ -691,13 +971,15 @@ def run_display(remote, monitor, state, out, image):
         override['after'] = remote.memory(0xC18183AC + 0x328, 16).hex()
     # C1.50 AO table1072fe84 index67 = enabled/bank1/mask8000,
     # independently matched to ID_SW1_MENU at107375b8.
-    keys = [0] * 8
-    keys[2] = 1 << 3
-    keys[4] = 100
-    call('native_menu_key_for_display', 0x1059AE16, struct.pack('<8I', *keys),
-         [('scratch', 0), 5, ('scratch', 20)])
-    call('native_gui_refresh_request', 0x10467D3E, bytes(8), [])
-    state['gui_event_injected'] = True
+    state['gui_event_injected'] = False
+    if state.get('q3_startup_assist'):
+        keys = [0] * 8
+        keys[2] = 1 << 3
+        keys[4] = 100
+        call('native_menu_key_for_display', 0x1059AE16, struct.pack('<8I', *keys),
+             [('scratch', 0), 5, ('scratch', 20)])
+        call('native_gui_refresh_request', 0x10467D3E, bytes(8), [])
+        state['gui_event_injected'] = True
     for i in range(6):
         run_to(0x100531BC)
         capture_output(f'output-{i+1:02d}')
@@ -738,10 +1020,13 @@ def run_display(remote, monitor, state, out, image):
         if state.get('sensor_standin'): points.add(SENSOR_ERROR_REPORT)
         if state.get('sensor_calibration_standin'): points.add(SENSOR_CALIBRATION_CHECK)
         if state.get('card_standin'): points.add(CARD_MEDIA_STATUS)
+        if state.get('card_files'): points |= {FS_OPEN, FS_READAT, FS_CLOSE, FS_WRITE}
+        points |= set(draw_points)
         if state.get('q4_trace_active'):
             points |= {pc for pc, n in watches.items() if n.startswith('trace_') or (
                        not state.get('q4_trace_pcs') and (n.endswith('_callback') or n == 'native_gui_dispatch'))}
         if state.get('trace_error_producer'): points |= {FLASH_WRITE, EXCEPTION_LOG_ACTION, FLASH_PROGRAM_ENTRY, FLASH_TRANSACTION_ENTRY, CPU_EXCEPTION_ENTRY, CAPTURE_STATUS_SETTER, *CAPTURE_INFO_POINTS, *TG_CONTROL_WRITES, *CSEQ_SENSOR_POINTS}
+        if state.get('trace_calibration_loader'): points |= CALIBRATION_TRACE_POINTS
         for pc in points: remote.command(f'Z1,{pc:x},2')
         end, standin_stops = time.monotonic() + seconds, 0
         while True:
@@ -793,6 +1078,61 @@ def run_display(remote, monitor, state, out, image):
         state['keep_awake_record'] = rec
         if int(rec['after'], 16) != 9 or rec['seconds_field_after'] != 0:
             raise RuntimeError('standby timer setting did not take effect')
+    def prepare_shooting_ui():
+        if state.get('shooting_ui_standin'):
+            ensure_shooting_ui_ready(remote, call, state.setdefault('shooting_ui_readiness', []))
+
+    def send_key(name, prefix):
+        # Both scripted and interactive keys use this native input path.
+        prepare_shooting_ui()
+        def held():
+            try:
+                free_run(prefix + '-held', .15, capture_frame=False)
+            finally:
+                run_to(0x100531BC)
+        press_key(name, call, remote.memory, held, prefix=prefix)
+
+    if state.get('shooting_ui_standin'):
+        run_to(0x100531BC)
+        prepare_shooting_ui()
+    quality_owned = set()
+    if state.get('i_menu_settings_standin'):
+        run_to(0x100531BC)
+        fixtures = state.setdefault('i_menu_settings_fixtures', [])
+        ensure_i_menu_settings(remote, call, fixtures)
+        quality_mirror = {int(r['setting'], 16): int(r['after'], 16) for r in fixtures
+                          if r['setting'] in ('0x1803', '0x1804')}
+        quality_owned = {int(r['setting'], 16) for r in fixtures
+                         if r['setting'] in ('0x1803', '0x1804') and r['injected']}
+        def quality_call(name, function, payload, arguments):
+            nonlocal deadline
+            deadline = time.monotonic() + 30
+            tracing = state.get('q4_trace_active', False)
+            state['q4_trace_active'] = False
+            try:
+                run_to(0x100531BC)
+                return call(name, function, payload, arguments)
+            finally:
+                state['q4_trace_active'] = tracing
+        def sync_quality():
+            return sync_quality_mirror(remote, quality_call, quality_mirror, quality_owned,
+                                       state.setdefault('i_quality_sync', []))
+        sync_quality()
+    else:
+        def sync_quality():
+            return False
+    if state.get('zh_hans_standin'):
+        run_to(0x100531BC)
+        enable_simplified_chinese(call, state.setdefault('zh_hans_fixture', []))
+    if state.get('read_settings') or state.get('write_settings'):
+        # Diagnostic: stock SettingDataService read/write (emulator session only).
+        run_to(0x100531BC)
+        rows = state.setdefault('setting_probe', [])  # Retain any earlier boot-time writes.
+        for key in state.get('read_settings', []):
+            rows.append(dict(op='read', key=hex(key), value=call(f'setting_read_{key:04x}', SETTING_READ, bytes(4), [key]).get('return_r0')))
+        for key, value in state.get('write_settings', []):
+            rows.append(write_observed_setting(call, 'setting', key, value))
+            quality_owned.discard(key)  # Explicit diagnostics own their value, even if unchanged.
     for i in range(3):
         free_run(f'scanout-{i+1:02d}')
     if state.get('start_liveview_test'):
@@ -847,6 +1187,18 @@ def run_display(remote, monitor, state, out, image):
         state['guest_observation'] = dict(start_ms=start_ms, end_ms=current_ms,
                                          elapsed_ms=(current_ms-start_ms) & 0xffffffff)
         capture_output('extended-observation')
+    if state.get('mailbox_self_test'):
+        from mailbox_probe import run_isolated_mailbox_test, run_isolated_flag_test
+        deadline = time.monotonic() + 30
+        def mailbox_test_call(*args, **kwargs):
+            run_to(0x100531BC)
+            return call(*args, **kwargs)
+        def mailbox_test_write(address, data):
+            if remote.command(f'M{address:x},{len(data):x}:' + data.hex()) != 'OK':
+                raise RuntimeError('isolated mailbox node write rejected')
+        state['mailbox_self_test_result'] = run_isolated_mailbox_test(
+            mailbox_test_call, remote.memory, mailbox_test_write)
+        state['flag_self_test_result'] = run_isolated_flag_test(mailbox_test_call)
     if state.get('q4_keys'):
         # Q4: once the shooting screen is up (the early MENU press above lands
         # during startup), press native keys through the same AO entry
@@ -854,37 +1206,119 @@ def run_display(remote, monitor, state, out, image):
         state['q4_presses'] = []
         for pc in state.get('q4_trace_pcs', []):   # opt-in breakpoints recorded only during traced presses
             watches[pc & ~1] = f'trace_{pc & ~1:08x}'
-        deadline = time.monotonic() + 30 + 10 * len(state['q4_keys'])   # run_to budget for the presses
+        min_guest_ms = state.get('q4_min_guest_ms', 20000)
+        def mailbox_snapshot(phase):
+            from mailbox_probe import decode_mailbox_result, decode_kernel_flag_poll
+            rows = []
+            run_to(0x100531BC)
+            for name in ('APPCTL',):
+                task = state['native_callbacks'].get(name)
+                if not task:
+                    rows.append(dict(task=name, status='unavailable'))
+                    continue
+                address = int(task['object'], 16) + 0x20
+                mailbox_id = struct.unpack('<I', remote.memory(address, 4))[0]
+                if not mailbox_id:
+                    rows.append(dict(task=name, status='invalid_id', mailbox_id=mailbox_id))
+                    continue
+                result = call('mailbox_' + phase + '_' + name, 0x10036230, bytes(12),
+                              [mailbox_id, ('scratch', 0)], thumb=False)
+                rows.append(dict(task=name, mailbox_id=mailbox_id,
+                                 **decode_mailbox_result(result['return_r0'], result['output'])))
+            # These pumps wait on event flags, not node mailboxes. Polling with
+            # mode 1 and timeout zero is diagnostic and does not imply idle.
+            for name, mask in (('SWSRV', 0x1ff), ('APPMENU', 1), ('GUISRV', 0x13)):
+                task = state['native_callbacks'].get(name)
+                if name != 'GUISRV' and not task:
+                    rows.append(dict(task=name, status='unavailable'))
+                    continue
+                address = 0xc1d91a74 if name == 'GUISRV' else int(task['object'], 16) + 0x20
+                flag_id = struct.unpack('<I', remote.memory(address, 4))[0]
+                result = call('flag_' + phase + '_' + name, 0x10036504, bytes(8),
+                              [flag_id, mask, 1, ('scratch', 4)], thumb=False)
+                rows.append(dict(task=name, object=hex(address), flag_id=flag_id, mask=hex(mask),
+                                 **decode_kernel_flag_poll(result['return_r0'], result['output'])))
+            ui = shooting_ui_snapshot(remote)
+            menu = native_menu_snapshot(remote) if ui['application'] == 1 else None
+            capture_output('mailbox-' + phase)
+            state.setdefault('mailbox_observations', []).append(dict(phase=phase, tasks=rows,
+                guest_ms=struct.unpack('<I', remote.memory(0xC18EB388, 4))[0],
+                ui=ui, menu=menu, rgb_sha256=state['frames'][-1]['rgb_sha256'],
+                native_idle_verified=False))
         for n, name in enumerate(state['q4_keys'], 1):
+            deadline = time.monotonic() + 30   # a fresh run_to budget per key
+            if state.get('trace_card_context'):
+                state['card_context_phase'] = f'q4-{n:02d}-{name}'
             run_to(0x100531BC)
             if state.get('q4_require_change'):
                 capture_output(f'q4-{n:02d}-before')
             previous_hash = state['frames'][-1]['rgb_sha256']
-            press = [0] * 8
-            press[Q4_KEYS[name] // 32] = 1 << (Q4_KEYS[name] % 32)
-            press[4] = 10
+            ui_before = shooting_ui_snapshot(remote)
+            menu_before = (native_menu_snapshot(remote) if state.get('q4_menu_state') and
+                           ui_before['application'] == 1 else None)
             ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
             if state.get('q4_trace_keys'):
                 state.setdefault('q4_trace', []).append(dict(key=name, guest_ms=ms, events=[]))
                 state['q4_trace_active'] = True
-            call(f'q4_key_{n:02d}_{name}', 0x1059AE16, struct.pack('<8I', *press),
-                 [('scratch', 0), 5, ('scratch', 20)])
-            # Capture until two consecutive frames match (screen settled), at most 4;
-            # single captures can land in a menu/shooting transition (blank frame).
+            send_key(name, f'q4_key_{n:02d}')
+            if state.get('q4_mailbox_probe'):
+                mailbox_snapshot(f'{n:02d}_after_key')
+            observation_start_ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
+            expected_menu = state.get('q4_expect_menu', [])[n - 1] if state.get('q4_expect_menu') else None
+            expected_frame = state.get('q4_expect_frames', [])[n - 1] if state.get('q4_expect_frames') else None
+            menu_observed = None
+            # Two equal frames can precede delayed native page work. Observe for
+            # the requested guest time before accepting visual stability. This
+            # remains a heuristic, not proof of the application's idle state.
             hashes = []
-            for k in range(12 if state.get('q4_require_change') else 4):
+            captures = max(12 if state.get('q4_require_change') else 4, (min_guest_ms + 499)//500 + 4)
+            if expected_frame is not None or expected_menu is not None:
+                captures = max(captures, (state.get('q4_max_guest_ms', 60000) + 499)//500 + 4)
+            for k in range(captures):
                 frame = f'q4-{n:02d}-{name}' + (f'-{k}' if k else '')
                 free_run(frame, .5)
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f'Q4 key {name} exceeded the host observation limit')
+                now_ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
+                if not q4_guest_budget_ok(observation_start_ms, now_ms, state.get('q4_max_guest_ms', 60000)):
+                    raise TimeoutError(f'Q4 key {name} exceeded the guest-time observation limit')
+                if sync_quality():
+                    hashes.clear()  # Wait for the native panel to redraw the new values.
+                    continue
                 hashes.append(state['frames'][-1]['rgb_sha256'])
+                elapsed_ms = guest_elapsed_ms(observation_start_ms, now_ms)
                 # a uniform (blank) frame is a transition, never a settled screen
-                settled = q4_frame_settled(previous_hash, hashes, state['frames'][-1]['nonuniform'], state.get('q4_require_change', False))
+                visual_settled = q4_frame_settled(previous_hash, hashes, state['frames'][-1]['nonuniform'],
+                    state.get('q4_require_change', False), elapsed_ms, min_guest_ms)
+                if expected_menu is not None:
+                    menu_observed = (native_menu_snapshot(remote) if shooting_ui_snapshot(remote)['application'] == 1 else None)
+                settled = (visual_settled and menu_expectation_met(expected_menu, menu_observed) and
+                           frame_expectation_met(expected_frame, hashes[-1]))
                 if settled: break
-            state['q4_presses'].append(dict(key=name, ao_index=Q4_KEYS[name], guest_ms=ms, frame=frame,
+            if not hashes:
+                raise RuntimeError(f'Q4 key {name} changed quality on the final observation frame')
+            if state.get('q4_mailbox_probe'):
+                mailbox_snapshot(f'{n:02d}_after_observation')
+            state['q4_presses'].append(dict(key=name, **key_metadata(name), guest_ms=ms, frame=frame,
                 rgb_sha256=hashes[-1], prior_rgb_sha256=previous_hash, changed=hashes[-1] != previous_hash,
-                settled=settled, captures=len(hashes)))
+                settled=settled, visual_stable=visual_settled, native_idle_verified=False,
+                frame_expected=expected_frame, frame_expected_met=frame_expectation_met(expected_frame, hashes[-1]),
+                observation_start_guest_ms=observation_start_ms, observation_guest_ms=elapsed_ms,
+                min_guest_ms=min_guest_ms,
+                captures=len(hashes), ui_before=ui_before, ui_after=shooting_ui_snapshot(remote),
+                **({'page_word_after': hex(struct.unpack('<I', remote.memory(0xC1819F90, 4))[0])}
+                   if state.get('trace_card_context') else {})))
+            if state.get('q4_menu_state'):
+                press = state['q4_presses'][-1]
+                press['menu_before'] = menu_before
+                press['menu_after'] = (native_menu_snapshot(remote) if press['ui_after']['application'] == 1 else None)
+                press['menu_expected'] = expected_menu
+                press['menu_expected_met'] = menu_expectation_met(expected_menu, press['menu_after'])
             state['q4_trace_active'] = False
-            if state.get('q4_require_change') and not settled:
-                raise RuntimeError(f'Q4 key {name} did not produce a changed, stable frame')
+            if (state.get('q4_require_change') or min_guest_ms or expected_menu is not None or expected_frame is not None) and not settled:
+                if expected_menu is not None and not menu_expectation_met(expected_menu, menu_observed):
+                    raise RuntimeError(f'Q4 key {name} did not reach expected menu page/row {expected_menu}; observed {menu_observed}')
+                raise RuntimeError(f'Q4 key {name} did not produce a stable frame within the observation budget')
     for address, size in state.get('dump_ranges', []):
         # Opt-in diagnostic: guest RAM after the Q4 sequence (output/ only, never committed).
         (out / f'ram-{address:08x}-{size:x}.bin').write_bytes(remote.memory(address, size))
@@ -893,6 +1327,7 @@ def run_display(remote, monitor, state, out, image):
         # the guest (same AO entry and press duration as Q4) and publishes the
         # newest LCD screendump. Ends on the page's stop button or time limit.
         import interactive_view
+        from interactive_readiness import InteractiveReadiness
         session = interactive_view.Session(state['interactive_port'], Q4_KEYS)
         session.start()
         print(f"INTERACTIVE_READY http://127.0.0.1:{state['interactive_port']}/", flush=True)
@@ -900,6 +1335,11 @@ def run_display(remote, monitor, state, out, image):
         live = out / 'interactive-live.ppm'
         end = time.monotonic() + 60 * state.get('interactive_minutes', 30)
         reason = 'time limit'
+        initial_ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
+        barrier = InteractiveReadiness(initial_ms)
+        barrier_deadline = time.monotonic() + 30
+        initial_barrier = state['interactive_initial_barrier'] = dict(
+            observation_start_guest_ms=initial_ms, native_idle_verified=False, visual_barrier_passed=False)
         try:
             while True:
                 if session.stopped:
@@ -907,25 +1347,48 @@ def run_display(remote, monitor, state, out, image):
                     break
                 if time.monotonic() >= end:
                     break
-                name = session.next_key()
+                name = session.next_key() if barrier is None else None
                 if name:
                     deadline = time.monotonic() + 30
                     run_to(0x100531BC)
-                    press = [0] * 8
-                    press[Q4_KEYS[name] // 32] = 1 << (Q4_KEYS[name] % 32)
-                    press[4] = 10
                     ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
-                    call(f'ui_key_{len(presses) + 1:03d}_{name}', 0x1059AE16, struct.pack('<8I', *press),
-                         [('scratch', 0), 5, ('scratch', 20)])
-                    presses.append(dict(key=name, ao_index=Q4_KEYS[name], guest_ms=ms))
+                    before = shooting_ui_snapshot(remote)
+                    send_key(name, f'ui_key_{len(presses) + 1:03d}')
+                    start_ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
+                    barrier = InteractiveReadiness(start_ms)
+                    barrier_deadline = time.monotonic() + 30
+                    presses.append(dict(key=name, **key_metadata(name), guest_ms=ms, ui_before=before,
+                                        observation_start_guest_ms=start_ms, native_idle_verified=False,
+                                        visual_barrier_passed=False))
                     del state['q3_calls'][:-50]
                 free_run('interactive', .2, capture_frame=False)
+                changed_quality = sync_quality()
                 del state['display_free_runs'][:-10]
                 if live.exists(): live.unlink()
                 monitor.command('screendump', {'filename': str(live)})
-                png = interactive_view.ppm_to_png(live.read_bytes())
-                session.publish(png, struct.unpack('<I', remote.memory(0xC18EB388, 4))[0], len(presses),
-                                '取景底图：主机合成参考图' if state.get('lv_background') else '')
+                ppm = live.read_bytes()
+                png = interactive_view.ppm_to_png(ppm)
+                current_ms = struct.unpack('<I', remote.memory(0xC18EB388, 4))[0]
+                if barrier is not None:
+                    if time.monotonic() >= barrier_deadline:
+                        raise TimeoutError('interactive key exceeded host observation limit')
+                    ui = shooting_ui_snapshot(remote)
+                    menu = native_menu_snapshot(remote) if ui['application'] == 1 else None
+                    frame = frame_stats(ppm)
+                    if changed_quality:
+                        barrier.previous = None
+                    ready = barrier.observe(current_ms, frame['rgb_sha256'], frame['nonuniform'], ui, menu)
+                    record = presses[-1] if presses else initial_barrier
+                    record.update(ui_after=ui, menu_after=menu, rgb_sha256=frame['rgb_sha256'],
+                                  observation_guest_ms=guest_elapsed_ms(barrier.start_ms, current_ms))
+                    if ready:
+                        record['visual_barrier_passed'] = True
+                        barrier = None
+                message = interactive_view.session_message(state.get('lv_background'),
+                    state.get('i_menu_settings_standin'), state.get('zh_hans_standin'))
+                if barrier is not None:
+                    message += ' · 等待界面稳定'
+                session.publish(png, current_ms, len(presses), message)
         finally:
             session.close()
             if live.exists(): live.unlink()
@@ -949,7 +1412,7 @@ def run_display(remote, monitor, state, out, image):
     candidates = [frame for frame in state['frames'] if frame.get('q3_candidate')]
     passed = bool(candidates)
     state['accepted_frame'] = candidates[-1]['png'] if candidates else None
-    state['q3_scope'] = 'native LCD pixels with explicit startup assistance; normal startup and menu operation unverified'
+    state['q3_scope'] = 'native LCD pixels with explicit startup assistance; sensor/ISP and camera hardware unverified'
     state.update(q3_verified=passed, emulator_verified=passed,
                  native_draw_verified=draw, lcd_scanout_verified=scanout)
     if passed: state.update(milestone='Q3')

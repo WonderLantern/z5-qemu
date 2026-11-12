@@ -477,6 +477,49 @@ def transform_board(original):
     result = result[:start] + '''        fprintf(stderr, "Z5_RAM_PROFILE scatter=10034000..10034120 "
                 "runtime_window=c0000000..cd8a0000 physical_capacity_verified=0\\n");''' + result[end:]
     result = transform_z5_ingress(result)
+    # Opt-in, immutable synthetic region 0x4a. Default remains erased; the
+    # digest prevents accidental use of a real calibration or arbitrary image.
+    calibration_edits = (
+        ('    MemoryRegion main_rom;',
+         '    MemoryRegion main_rom;\n    gchar *calibration_input;'),
+        ('    s->z5_profile = true;', '''    s->z5_profile = true;
+    const char *calibration_path = getenv("Z5_SYNTHETIC_CALIBRATION");
+    if (calibration_path) {
+        gsize calibration_len = 0;
+        GError *calibration_error = NULL;
+        if (!g_file_get_contents(calibration_path, &s->calibration_input,
+                                 &calibration_len, &calibration_error)) {
+            error_report("Cannot read synthetic calibration: %s", calibration_error->message);
+            exit(1);
+        }
+        g_autofree gchar *digest = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
+            (const guchar *)s->calibration_input, calibration_len);
+        if (calibration_len != 0x180000 || g_strcmp0(digest,
+            "2500f5782cca0407d00dc525a2e9b565e4a94838cfe8d986a01c2f526e9fbc50")) {
+            error_report("Synthetic calibration profile mismatch");
+            exit(1);
+        }
+        fprintf(stderr, "Z5_SYNTHETIC_CALIBRATION size=0x180000 assumption_only=1\\n");
+    }'''),
+        ('    if (s->recovery_profile && addr >= 0x12121000 && addr + size <= 0x14000000) {',
+         '''    if (s->calibration_input && addr >= 0x13e80000 &&
+        addr + size <= 0x14000000 && size <= 8) {
+        uint64_t value = 0;
+        for (unsigned i = 0; i < size; i++) {
+            value |= (uint64_t)(uint8_t)s->calibration_input[addr - 0x13e80000 + i] << (8 * i);
+        }
+        return value;
+    }
+    if (s->recovery_profile && addr >= 0x12121000 && addr + size <= 0x14000000) {'''),
+        ('bool source_ok = (r[1] >= 0x10000000 && (uint64_t)r[1] + len <= 0x12121000) ||',
+         '''bool source_ok = (r[1] >= 0x10000000 && (uint64_t)r[1] + len <= 0x12121000) ||
+                             (s->calibration_input && r[1] >= 0x13e80000 &&
+                              (uint64_t)r[1] + len <= 0x14000000) ||'''),
+    )
+    for old, new in calibration_edits:
+        if result.count(old) != 1:
+            raise ValueError('synthetic calibration anchor changed: ' + old.splitlines()[0])
+        result = result.replace(old, new, 1)
     return '''/* Z5 Q1/Q2 port from WonderLantern/z6-qemu 419a1f2.
  * All inherited instruction references in comments remain Z6 research leads,
  * including mechanically renamed comments. No Z5 peripheral equivalence proven.

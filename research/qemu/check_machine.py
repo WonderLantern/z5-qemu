@@ -1,9 +1,9 @@
 """用自建数据检查实际 QEMU 的映射、启动寄存器、输入保护与未知访问停止。"""
 import argparse
-from publication_paths import output_root
 import json
 import os
 from pathlib import Path
+from publication_paths import output_root
 import socket
 import struct
 import subprocess

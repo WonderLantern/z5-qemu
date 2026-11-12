@@ -10,6 +10,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class PortSourceTests(unittest.TestCase):
+    def test_calibration_input_is_opt_in_and_dma_limited(self):
+        original = (ROOT / 'reference/z6-qemu/qemu/nikon-z6.c').read_text(encoding='utf-8')
+        result = port_source.transform_board(original)
+        self.assertIn('Z5_SYNTHETIC_CALIBRATION', result)
+        self.assertIn('2500f5782cca0407d00dc525a2e9b565e4a94838cfe8d986a01c2f526e9fbc50', result)
+        self.assertIn('s->calibration_input && r[1] >= 0x13e80000', result)
+        self.assertIn('(uint64_t)r[1] + len <= 0x14000000', result)
     def test_memory_windows_merge_scatter_with_documented_runtime_range(self):
         rows = [dict(destination='0xC1800000', size=0x100),
                 dict(destination='0x80800000', size=0x200000),
